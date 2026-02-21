@@ -1,8 +1,13 @@
 /**
- * QT Py Synth WAV Converter (Offline bundle)
+ * QT Py Synth WAV Converter
  *
- * Requires deps/ffmpeg-core.js + deps/ffmpeg-core.wasm + deps/worker.js
- * Optionally deps/jszip.esm.js
+ * deps/ must contain:
+ * - ffmpeg-core.js
+ * - ffmpeg-core.wasm
+ * - worker.js
+ * - ffmpeg.esm.js
+ * - ffmpeg-util.esm.js
+ * - jszip.esm.js
  */
 import JSZip from "./deps/jszip.esm.js";
 import { FFmpeg } from "./deps/ffmpeg.esm.js";
@@ -17,6 +22,7 @@ const UI = {
   fadeLen: document.getElementById("fadeLen"),
   convertBtn: document.getElementById("convertBtn"),
   zipBtn: document.getElementById("zipBtn"),
+  selfCheckBtn: document.getElementById("selfCheckBtn"),
   log: document.getElementById("log"),
   results: document.getElementById("results"),
 };
@@ -34,17 +40,57 @@ function log(line) {
   UI.log.scrollTop = UI.log.scrollHeight;
 }
 
+async function selfCheckDeps() {
+  const deps = [
+    "./app.js",
+    "./deps/ffmpeg-core.js",
+    "./deps/ffmpeg-core.wasm",
+    "./deps/worker.js",
+    "./deps/ffmpeg.esm.js",
+    "./deps/ffmpeg-util.esm.js",
+    "./deps/jszip.esm.js",
+  ];
+
+  log("Self-check started...");
+
+  for (const url of deps) {
+    try {
+      const r = await fetch(url, { cache: "no-store" });
+      if (!r.ok) {
+        log(`❌ ${url} -> ${r.status}`);
+        continue;
+      }
+      const size = r.headers.get("content-length");
+      log(`✅ ${url} -> ${r.status}${size ? ` (${size} bytes)` : ""}`);
+    } catch (e) {
+      log(`❌ ${url} -> ${e?.message || String(e)}`);
+    }
+  }
+
+  try {
+    const w = new Worker("./deps/worker.js", { type: "module" });
+    w.terminate();
+    log("✅ Worker probe: OK");
+  } catch (e) {
+    log(`❌ Worker probe failed: ${e?.message || String(e)}`);
+  }
+
+  log("Self-check done.");
+}
+
 function setFiles(files) {
-  selectedFiles = Array.from(files || []).filter(
-    (f) => f && (f.type === "audio/wav" || f.name.toLowerCase().endsWith(".wav"))
-  );
+  // Don't over-filter here; some browsers set File.type="".
+  selectedFiles = Array.from(files || []).filter((f) => f && f.name);
+
   UI.convertBtn.disabled = selectedFiles.length === 0;
   UI.zipBtn.disabled = true;
+
   converted = [];
   UI.results.innerHTML = "";
   UI.log.textContent = "";
+
   if (selectedFiles.length) log(`Selected ${selectedFiles.length} file(s).`);
-  else log("No WAV files selected.");
+  else log("No files selected.");
 }
 
 function getTargetWaves() {
@@ -64,9 +110,6 @@ async function ensureFFmpeg() {
   if (ffmpegLoaded) return;
 
   log("Loading ffmpeg.wasm ...");
-
-  // Use local deps (no CDN)
-  // Use blob URLs to keep Worker same-origin safe.
   const coreURL = await toBlobURL("./deps/ffmpeg-core.js", "text/javascript");
   const wasmURL = await toBlobURL("./deps/ffmpeg-core.wasm", "application/wasm");
   const classWorkerURL = await toBlobURL("./deps/worker.js", "text/javascript");
@@ -125,7 +168,6 @@ function parseWavPcm16Mono(buf) {
 
   if (!fmt) throw new Error("WAV missing fmt chunk");
   if (dataOff < 0) throw new Error("WAV missing data chunk");
-
   if (fmt.audioFormat !== 1) throw new Error("WAV is not PCM (format != 1)");
   if (fmt.numChannels !== 1) throw new Error("WAV is not mono");
   if (fmt.bitsPerSample !== 16) throw new Error("WAV is not 16-bit");
@@ -193,6 +235,7 @@ function applyFade(samples, fadeIn, fadeOut, fadeLen) {
 
   let n = fadeLen | 0;
   if (n <= 0) return out;
+
   const maxFade = Math.floor(out.length / 2);
   if (n > maxFade) n = maxFade;
   if (n <= 0) return out;
@@ -249,12 +292,8 @@ async function convertOne(file, targetWaves, doFadeIn, doFadeOut, fadeLen) {
 
   const blob = writeWavPcm16Mono(fixed, 44100);
 
-  try {
-    await ffmpeg.deleteFile(inName);
-  } catch {}
-  try {
-    await ffmpeg.deleteFile(midName);
-  } catch {}
+  try { await ffmpeg.deleteFile(inName); } catch {}
+  try { await ffmpeg.deleteFile(midName); } catch {}
 
   return { outName, blob, info: { inSamples: samples.length, outSamples: targetSamples } };
 }
@@ -350,6 +389,7 @@ UI.drop.addEventListener("drop", (e) => {
 UI.fileInput.addEventListener("change", (e) => setFiles(e.target.files));
 UI.convertBtn.addEventListener("click", onConvert);
 UI.zipBtn.addEventListener("click", downloadZip);
+UI.selfCheckBtn.addEventListener("click", selfCheckDeps);
 
 // Init
 setFiles([]);

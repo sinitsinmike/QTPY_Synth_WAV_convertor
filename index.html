@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>QT Py Synth WAV Converter (Offline)</title>
+  <title>QT Py Synth WAV Converter (Offline bundle)</title>
   <style>
     :root { font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, sans-serif; }
     body { margin: 0; background: #0b0c10; color: #eaf0ff; }
@@ -40,9 +40,7 @@
       <div class="warn">
         <div style="font-weight:700;">Важно</div>
         <div class="muted" style="margin-top:6px;">
-          Большинство браузеров блокируют <code>Worker</code> при открытии как <code>file://</code>.
-          Надёжно работает при запуске через локальный http-сервер (например, "Live Server" в VS Code) или в будущем как Tauri-app.
-          В README внутри архива есть простые варианты запуска.
+          Если что-то не работает: нажми <b>Self-check deps</b> и посмотри лог.
         </div>
       </div>
 
@@ -88,6 +86,7 @@
         <div>
           <button id="convertBtn" disabled>Convert</button>
           <button id="zipBtn" disabled style="margin-top:10px;">Download all as ZIP</button>
+          <button id="selfCheckBtn" style="margin-top:10px;">Self-check deps</button>
         </div>
       </div>
 
