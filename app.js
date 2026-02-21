@@ -167,7 +167,8 @@ async function ensureFFmpeg({ forceReload = false } = {}) {
   const wasmURL = await toBlobURL("./deps/ffmpeg-core.wasm", "application/wasm");
 
   // MUST be normal URL so worker.js can import ./const.js and ./errors.js
-  const classWorkerURL = "./deps/worker.js";
+  // Absolute URL so FFmpeg doesn't resolve it relative to CDN import.meta.url
+  const classWorkerURL = new URL("./deps/worker.js", window.location.href).href;
 
   const loadPromise = ffmpeg.load({ coreURL, wasmURL, classWorkerURL });
   const timeoutPromise = new Promise((_, rej) =>
