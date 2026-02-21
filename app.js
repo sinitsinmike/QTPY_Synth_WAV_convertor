@@ -1,20 +1,20 @@
 /* file: app.js
- * QT Py Synth WAV Converter (GitHub Pages)
+ * QT Py Synth WAV Converter (GitHub Pages) — FINAL
  *
- * Deps in ./deps:
+ * Required in ./deps:
  * - ffmpeg-core.js
  * - ffmpeg-core.wasm
  * - worker.js
  * - const.js
  * - errors.js
  *
- * NOTE:
- * - We load @ffmpeg/ffmpeg + @ffmpeg/util + jszip from CDN as ESM (complete module graph).
- * - We load core/wasm from local ./deps (stable same-origin).
+ * Notes:
+ * - Uses CDN ESM for @ffmpeg/ffmpeg + @ffmpeg/util + jszip (complete module graph).
+ * - Uses local ./deps for core/wasm and class worker chain.
  * - classWorkerURL MUST be a normal URL (not blob), because worker.js imports ./const.js and ./errors.js.
  */
 
-const BUILD = "pages-final-v1";
+const BUILD = "pages-final-v2";
 
 const UI = {
   drop: document.getElementById("drop"),
@@ -27,6 +27,7 @@ const UI = {
   zipBtn: document.getElementById("zipBtn"),
   selfCheckBtn: document.getElementById("selfCheckBtn"),
   loadBtn: document.getElementById("loadBtn"),
+  stopBtn: document.getElementById("stopBtn"),
   log: document.getElementById("log"),
   results: document.getElementById("results"),
 };
@@ -37,6 +38,9 @@ let converted = [];
 let deps = null; // { FFmpeg, fetchFile, toBlobURL, JSZip }
 let ffmpeg = null;
 let ffmpegLoaded = false;
+
+// Simple cancel flag (ffmpeg.wasm exec itself isn't cancellable, but we can stop the loop between files)
+let cancelRequested = false;
 
 function log(line) {
   if (!UI.log) return;
@@ -55,18 +59,25 @@ window.addEventListener("unhandledrejection", (e) =>
 
 log(`app.js loaded (${BUILD})`);
 
-function setFiles(files) {
-  // Do not filter by File.type (often empty in some browsers).
-  selectedFiles = Array.from(files || []).filter((f) => f && f.name);
+function setButtonsBusy(busy) {
+  if (UI.convertBtn) UI.convertBtn.disabled = busy || selectedFiles.length === 0;
+  if (UI.zipBtn) UI.zipBtn.disabled = busy || converted.length <= 1;
+  if (UI.loadBtn) UI.loadBtn.disabled = busy;
+  if (UI.selfCheckBtn) UI.selfCheckBtn.disabled = busy;
+  if (UI.stopBtn) UI.stopBtn.disabled = !busy;
+}
 
-  if (UI.convertBtn) UI.convertBtn.disabled = selectedFiles.length === 0;
-  if (UI.zipBtn) UI.zipBtn.disabled = true;
+function setFiles(files) {
+  selectedFiles = Array.from(files || []).filter((f) => f && f.name);
 
   converted = [];
   if (UI.results) UI.results.innerHTML = "";
   clearLog();
   log(`app.js loaded (${BUILD})`);
   log(selectedFiles.length ? `Selected ${selectedFiles.length} file(s).` : "No files selected.");
+
+  cancelRequested = false;
+  setButtonsBusy(false);
 }
 
 function getTargetWaves() {
@@ -105,11 +116,19 @@ async function selfCheckDeps() {
     }
   }
 
-  // Worker import probe
+  // Real ESM import check for worker.js (will fail if const.js/errors.js missing)
+  try {
+    await import("./deps/worker.js");
+    log("✅ import('./deps/worker.js'): OK");
+  } catch (e) {
+    log(`❌ import('./deps/worker.js') failed: ${e?.message || String(e)}`);
+  }
+
+  // Worker probe
   try {
     const w = new Worker("./deps/worker.js", { type: "module" });
     w.terminate();
-    log("✅ Worker probe: OK (worker.js loads as module)");
+    log("✅ Worker probe: OK");
   } catch (e) {
     log(`❌ Worker probe failed: ${e?.message || String(e)}`);
   }
@@ -138,19 +157,16 @@ async function ensureFFmpeg({ forceReload = false } = {}) {
   const { FFmpeg, toBlobURL } = await loadDeps();
   ffmpeg = new FFmpeg();
 
-  // Show ffmpeg internal logs in our log (helps debug “stuck” cases)
   ffmpeg.on("log", ({ message }) => {
-    // Keep it readable
     if (message) log(message);
   });
 
   log("Loading ffmpeg.wasm ...");
 
-  // Core & WASM as blob URLs are safe.
   const coreURL = await toBlobURL("./deps/ffmpeg-core.js", "text/javascript");
   const wasmURL = await toBlobURL("./deps/ffmpeg-core.wasm", "application/wasm");
 
-  // IMPORTANT: must be a normal URL so worker.js can import ./const.js and ./errors.js
+  // MUST be normal URL so worker.js can import ./const.js and ./errors.js
   const classWorkerURL = "./deps/worker.js";
 
   const loadPromise = ffmpeg.load({ coreURL, wasmURL, classWorkerURL });
@@ -229,9 +245,7 @@ function writeWavPcm16Mono(samples, sampleRate = 44100) {
   const dv = new DataView(buf);
   const u8 = new Uint8Array(buf);
 
-  const putStr = (off, s) => {
-    for (let i = 0; i < s.length; i++) u8[off + i] = s.charCodeAt(i);
-  };
+  const putStr = (off, s) => { for (let i = 0; i < s.length; i++) u8[off + i] = s.charCodeAt(i); };
 
   putStr(0, "RIFF");
   dv.setUint32(4, riffSize, true);
@@ -271,11 +285,10 @@ function applyFade(samples, fadeIn, fadeOut, fadeLen) {
   if (n <= 0) return out;
 
   if (fadeIn) for (let i = 0; i < n; i++) out[i] = (out[i] * (i / n)) | 0;
-  if (fadeOut)
-    for (let i = 0; i < n; i++) {
-      const idx = out.length - n + i;
-      out[idx] = (out[idx] * (1 - i / n)) | 0;
-    }
+  if (fadeOut) for (let i = 0; i < n; i++) {
+    const idx = out.length - n + i;
+    out[idx] = (out[idx] * (1 - i / n)) | 0;
+  }
   return out;
 }
 
@@ -289,18 +302,12 @@ async function convertOne(file, targetWaves, doFadeIn, doFadeOut, fadeLen) {
 
   await ffmpeg.writeFile(inName, await fetchFile(file));
   await ffmpeg.exec([
-    "-hide_banner",
-    "-y",
-    "-i",
-    inName,
-    "-ac",
-    "1",
-    "-ar",
-    "44100",
-    "-c:a",
-    "pcm_s16le",
-    "-map_metadata",
-    "-1",
+    "-hide_banner","-y",
+    "-i", inName,
+    "-ac","1",
+    "-ar","44100",
+    "-c:a","pcm_s16le",
+    "-map_metadata","-1",
     midName,
   ]);
 
@@ -358,23 +365,39 @@ async function downloadZip() {
   setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
 
+async function onLoadOnly() {
+  cancelRequested = false;
+  setButtonsBusy(true);
+  clearLog();
+  log(`Load ffmpeg only... (${BUILD})`);
+  try {
+    await ensureFFmpeg();
+    log("OK: ffmpeg is ready.");
+  } catch (e) {
+    log(`ERROR: ${e?.message || String(e)}`);
+  } finally {
+    setButtonsBusy(false);
+  }
+}
+
 async function onConvert() {
-  UI.convertBtn.disabled = true;
-  UI.zipBtn.disabled = true;
+  cancelRequested = false;
+  setButtonsBusy(true);
+
   UI.results.innerHTML = "";
   clearLog();
   converted = [];
+
+  if (!selectedFiles.length) {
+    log("No files.");
+    setButtonsBusy(false);
+    return;
+  }
 
   const targetWaves = getTargetWaves();
   const doFadeIn = UI.fadeIn.checked;
   const doFadeOut = UI.fadeOut.checked;
   const fadeLen = getFadeLen();
-
-  if (!selectedFiles.length) {
-    log("No files.");
-    UI.convertBtn.disabled = false;
-    return;
-  }
 
   log(`Target: ${targetWaves} waves × 256 = ${targetWaves * 256} samples`);
   log(`Fade-in: ${doFadeIn ? "ON" : "OFF"}, Fade-out: ${doFadeOut ? "ON" : "OFF"}, FadeLen: ${fadeLen}`);
@@ -383,6 +406,10 @@ async function onConvert() {
     await ensureFFmpeg();
 
     for (let i = 0; i < selectedFiles.length; i++) {
+      if (cancelRequested) {
+        log("\nStopped by user.");
+        break;
+      }
       const f = selectedFiles[i];
       log(`\n[${i + 1}/${selectedFiles.length}] Converting: ${f.name}`);
       const res = await convertOne(f, targetWaves, doFadeIn, doFadeOut, fadeLen);
@@ -390,24 +417,18 @@ async function onConvert() {
       log(`OK: ${res.outName}`);
     }
 
-    UI.zipBtn.disabled = converted.length <= 1;
-    log(`\nDone. Converted: ${converted.length}`);
+    if (!cancelRequested) log(`\nDone. Converted: ${converted.length}`);
+    if (UI.zipBtn) UI.zipBtn.disabled = converted.length <= 1;
   } catch (e) {
     log(`\nERROR: ${e?.message || String(e)}`);
   } finally {
-    UI.convertBtn.disabled = selectedFiles.length === 0;
+    setButtonsBusy(false);
   }
 }
 
-async function onLoadOnly() {
-  clearLog();
-  log(`Load ffmpeg only... (${BUILD})`);
-  try {
-    await ensureFFmpeg({ forceReload: false });
-    log("OK: ffmpeg is ready.");
-  } catch (e) {
-    log(`ERROR: ${e?.message || String(e)}`);
-  }
+function onStop() {
+  cancelRequested = true;
+  log("Stop requested… (will stop after current file finishes)");
 }
 
 // Bind UI
@@ -425,5 +446,7 @@ UI.convertBtn?.addEventListener("click", onConvert);
 UI.zipBtn?.addEventListener("click", () => downloadZip().catch((e) => log(`ZIP ERROR: ${e?.message || e}`)));
 UI.selfCheckBtn?.addEventListener("click", () => selfCheckDeps().catch((e) => log(`CHECK ERROR: ${e?.message || e}`)));
 UI.loadBtn?.addEventListener("click", onLoadOnly);
+UI.stopBtn?.addEventListener("click", onStop);
 
+setButtonsBusy(false);
 setFiles([]);
