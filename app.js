@@ -1,9 +1,20 @@
-/* file: app.js (build: pages-v5)
- * Uses CDN ESM for @ffmpeg/ffmpeg + @ffmpeg/util (so no missing module graph).
- * Uses local /deps for core + workers to avoid silent worker failures.
+/* file: app.js
+ * QT Py Synth WAV Converter (GitHub Pages)
+ *
+ * Deps in ./deps:
+ * - ffmpeg-core.js
+ * - ffmpeg-core.wasm
+ * - worker.js
+ * - const.js
+ * - errors.js
+ *
+ * NOTE:
+ * - We load @ffmpeg/ffmpeg + @ffmpeg/util + jszip from CDN as ESM (complete module graph).
+ * - We load core/wasm from local ./deps (stable same-origin).
+ * - classWorkerURL MUST be a normal URL (not blob), because worker.js imports ./const.js and ./errors.js.
  */
 
-const BUILD = "pages-v5";
+const BUILD = "pages-final-v1";
 
 const UI = {
   drop: document.getElementById("drop"),
@@ -15,6 +26,7 @@ const UI = {
   convertBtn: document.getElementById("convertBtn"),
   zipBtn: document.getElementById("zipBtn"),
   selfCheckBtn: document.getElementById("selfCheckBtn"),
+  loadBtn: document.getElementById("loadBtn"),
   log: document.getElementById("log"),
   results: document.getElementById("results"),
 };
@@ -27,34 +39,45 @@ let ffmpeg = null;
 let ffmpegLoaded = false;
 
 function log(line) {
+  if (!UI.log) return;
   UI.log.textContent += `${line}\n`;
   UI.log.scrollTop = UI.log.scrollHeight;
 }
-function clearLog() { UI.log.textContent = ""; }
+function clearLog() {
+  if (!UI.log) return;
+  UI.log.textContent = "";
+}
 
 window.addEventListener("error", (e) => log(`JS ERROR: ${e.message}`));
-window.addEventListener("unhandledrejection", (e) => log(`PROMISE ERROR: ${e.reason?.message || String(e.reason)}`));
+window.addEventListener("unhandledrejection", (e) =>
+  log(`PROMISE ERROR: ${e.reason?.message || String(e.reason)}`)
+);
+
 log(`app.js loaded (${BUILD})`);
 
 function setFiles(files) {
+  // Do not filter by File.type (often empty in some browsers).
   selectedFiles = Array.from(files || []).filter((f) => f && f.name);
-  UI.convertBtn.disabled = selectedFiles.length === 0;
-  UI.zipBtn.disabled = true;
+
+  if (UI.convertBtn) UI.convertBtn.disabled = selectedFiles.length === 0;
+  if (UI.zipBtn) UI.zipBtn.disabled = true;
+
   converted = [];
-  UI.results.innerHTML = "";
+  if (UI.results) UI.results.innerHTML = "";
   clearLog();
   log(`app.js loaded (${BUILD})`);
   log(selectedFiles.length ? `Selected ${selectedFiles.length} file(s).` : "No files selected.");
 }
 
 function getTargetWaves() {
-  const v = UI.wavesSelect.value;
+  const v = UI.wavesSelect?.value ?? "auto";
   if (v === "auto") return 64;
   const n = Number(v);
   return Number.isFinite(n) ? n : 64;
 }
+
 function getFadeLen() {
-  const v = Number(UI.fadeLen.value);
+  const v = Number(UI.fadeLen?.value ?? 0);
   if (!Number.isFinite(v) || v < 0) return 0;
   return Math.floor(v);
 }
@@ -62,15 +85,16 @@ function getFadeLen() {
 async function selfCheckDeps() {
   clearLog();
   log(`Self-check started... (${BUILD})`);
+
   const urls = [
     "./app.js",
     "./deps/ffmpeg-core.js",
     "./deps/ffmpeg-core.wasm",
-    "./deps/ffmpeg-core.worker.js",
     "./deps/worker.js",
     "./deps/const.js",
     "./deps/errors.js",
   ];
+
   for (const url of urls) {
     try {
       const r = await fetch(url, { cache: "no-store" });
@@ -80,6 +104,16 @@ async function selfCheckDeps() {
       log(`❌ ${url} -> ${e?.message || String(e)}`);
     }
   }
+
+  // Worker import probe
+  try {
+    const w = new Worker("./deps/worker.js", { type: "module" });
+    w.terminate();
+    log("✅ Worker probe: OK (worker.js loads as module)");
+  } catch (e) {
+    log(`❌ Worker probe failed: ${e?.message || String(e)}`);
+  }
+
   log("Self-check done.");
 }
 
@@ -98,26 +132,32 @@ async function loadDeps() {
   return deps;
 }
 
-async function ensureFFmpeg() {
-  if (ffmpegLoaded) return;
+async function ensureFFmpeg({ forceReload = false } = {}) {
+  if (ffmpegLoaded && !forceReload) return;
 
   const { FFmpeg, toBlobURL } = await loadDeps();
   ffmpeg = new FFmpeg();
-  ffmpeg.on("log", ({ message }) => log(message)); // useful for “stuck” cases
+
+  // Show ffmpeg internal logs in our log (helps debug “stuck” cases)
+  ffmpeg.on("log", ({ message }) => {
+    // Keep it readable
+    if (message) log(message);
+  });
 
   log("Loading ffmpeg.wasm ...");
 
-  // local assets (same origin)
+  // Core & WASM as blob URLs are safe.
   const coreURL = await toBlobURL("./deps/ffmpeg-core.js", "text/javascript");
   const wasmURL = await toBlobURL("./deps/ffmpeg-core.wasm", "application/wasm");
-  const workerURL = await toBlobURL("./deps/ffmpeg-core.worker.js", "text/javascript");
 
-  // IMPORTANT: class worker must be a normal URL so it can import ./const.js and ./errors.js
+  // IMPORTANT: must be a normal URL so worker.js can import ./const.js and ./errors.js
   const classWorkerURL = "./deps/worker.js";
 
-  // Add timeout so it never “hangs silently”
-  const loadPromise = ffmpeg.load({ coreURL, wasmURL, workerURL, classWorkerURL });
-  const timeoutPromise = new Promise((_, rej) => setTimeout(() => rej(new Error("ffmpeg.load() timeout (15s)")), 15000));
+  const loadPromise = ffmpeg.load({ coreURL, wasmURL, classWorkerURL });
+  const timeoutPromise = new Promise((_, rej) =>
+    setTimeout(() => rej(new Error("ffmpeg.load() timeout (20s)")), 20000)
+  );
+
   await Promise.race([loadPromise, timeoutPromise]);
 
   ffmpegLoaded = true;
@@ -139,16 +179,27 @@ function parseWavPcm16Mono(buf) {
 
   if (str4(0) !== "RIFF" || str4(8) !== "WAVE") throw new Error("Not a RIFF/WAVE file");
 
-  let offset = 12, fmt = null, dataOff = -1, dataSize = 0;
+  let offset = 12;
+  let fmt = null;
+  let dataOff = -1;
+  let dataSize = 0;
+
   while (offset + 8 <= u8.length) {
     const id = str4(offset);
     const size = u32(offset + 4);
     const body = offset + 8;
 
     if (id === "fmt ") {
-      fmt = { audioFormat: u16(body + 0), numChannels: u16(body + 2), sampleRate: u32(body + 4), bitsPerSample: u16(body + 14) };
+      fmt = {
+        audioFormat: u16(body + 0),
+        numChannels: u16(body + 2),
+        sampleRate: u32(body + 4),
+        bitsPerSample: u16(body + 14),
+      };
     } else if (id === "data") {
-      dataOff = body; dataSize = size; break;
+      dataOff = body;
+      dataSize = size;
+      break;
     }
     offset = body + size + (size % 2);
   }
@@ -162,11 +213,13 @@ function parseWavPcm16Mono(buf) {
   const dataEnd = Math.min(dataOff + dataSize, u8.length);
   const pcmBytes = u8.slice(dataOff, dataEnd);
   const pcmBuf = pcmBytes.buffer.slice(pcmBytes.byteOffset, pcmBytes.byteOffset + pcmBytes.byteLength);
+
   return { sampleRate: fmt.sampleRate, samples: new Int16Array(pcmBuf) };
 }
 
 function writeWavPcm16Mono(samples, sampleRate = 44100) {
-  const numChannels = 1, bitsPerSample = 16;
+  const numChannels = 1;
+  const bitsPerSample = 16;
   const blockAlign = numChannels * (bitsPerSample / 8);
   const byteRate = sampleRate * blockAlign;
   const dataSize = samples.length * 2;
@@ -176,11 +229,25 @@ function writeWavPcm16Mono(samples, sampleRate = 44100) {
   const dv = new DataView(buf);
   const u8 = new Uint8Array(buf);
 
-  const putStr = (off, s) => { for (let i = 0; i < s.length; i++) u8[off + i] = s.charCodeAt(i); };
-  putStr(0, "RIFF"); dv.setUint32(4, riffSize, true); putStr(8, "WAVE");
-  putStr(12, "fmt "); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, numChannels, true);
-  dv.setUint32(24, sampleRate, true); dv.setUint32(28, byteRate, true); dv.setUint16(32, blockAlign, true); dv.setUint16(34, bitsPerSample, true);
-  putStr(36, "data"); dv.setUint32(40, dataSize, true);
+  const putStr = (off, s) => {
+    for (let i = 0; i < s.length; i++) u8[off + i] = s.charCodeAt(i);
+  };
+
+  putStr(0, "RIFF");
+  dv.setUint32(4, riffSize, true);
+  putStr(8, "WAVE");
+
+  putStr(12, "fmt ");
+  dv.setUint32(16, 16, true);
+  dv.setUint16(20, 1, true);
+  dv.setUint16(22, numChannels, true);
+  dv.setUint32(24, sampleRate, true);
+  dv.setUint32(28, byteRate, true);
+  dv.setUint16(32, blockAlign, true);
+  dv.setUint16(34, bitsPerSample, true);
+
+  putStr(36, "data");
+  dv.setUint32(40, dataSize, true);
 
   new Int16Array(buf, 44, samples.length).set(samples);
   return new Blob([buf], { type: "audio/wav" });
@@ -195,17 +262,20 @@ function trimOrPad(samples, targetLen) {
 function applyFade(samples, fadeIn, fadeOut, fadeLen) {
   const out = new Int16Array(samples.length);
   out.set(samples);
+
   let n = fadeLen | 0;
   if (n <= 0) return out;
+
   const maxFade = Math.floor(out.length / 2);
   if (n > maxFade) n = maxFade;
   if (n <= 0) return out;
 
   if (fadeIn) for (let i = 0; i < n; i++) out[i] = (out[i] * (i / n)) | 0;
-  if (fadeOut) for (let i = 0; i < n; i++) {
-    const idx = out.length - n + i;
-    out[idx] = (out[idx] * (1 - i / n)) | 0;
-  }
+  if (fadeOut)
+    for (let i = 0; i < n; i++) {
+      const idx = out.length - n + i;
+      out[idx] = (out[idx] * (1 - i / n)) | 0;
+    }
   return out;
 }
 
@@ -218,7 +288,21 @@ async function convertOne(file, targetWaves, doFadeIn, doFadeOut, fadeLen) {
   const outName = `${base}_qtpy_${targetWaves}x256.wav`;
 
   await ffmpeg.writeFile(inName, await fetchFile(file));
-  await ffmpeg.exec(["-hide_banner","-y","-i",inName,"-ac","1","-ar","44100","-c:a","pcm_s16le","-map_metadata","-1",midName]);
+  await ffmpeg.exec([
+    "-hide_banner",
+    "-y",
+    "-i",
+    inName,
+    "-ac",
+    "1",
+    "-ar",
+    "44100",
+    "-c:a",
+    "pcm_s16le",
+    "-map_metadata",
+    "-1",
+    midName,
+  ]);
 
   const mid = await ffmpeg.readFile(midName);
   const midBuf = mid.buffer.slice(mid.byteOffset, mid.byteOffset + mid.byteLength);
@@ -240,15 +324,19 @@ async function convertOne(file, targetWaves, doFadeIn, doFadeOut, fadeLen) {
 
 function addResult(name, blob, info) {
   const url = URL.createObjectURL(blob);
+
   const li = document.createElement("li");
   const a = document.createElement("a");
-  a.href = url; a.download = name; a.textContent = name;
+  a.href = url;
+  a.download = name;
+  a.textContent = name;
 
   const meta = document.createElement("div");
   meta.className = "muted";
   meta.textContent = `samples: ${info.inSamples} → ${info.outSamples}`;
 
-  li.appendChild(a); li.appendChild(meta);
+  li.appendChild(a);
+  li.appendChild(meta);
   UI.results.appendChild(li);
 
   converted.push({ name, blob });
@@ -258,11 +346,15 @@ async function downloadZip() {
   const { JSZip } = await loadDeps();
   const zip = new JSZip();
   for (const item of converted) zip.file(item.name, item.blob);
+
   const blob = await zip.generateAsync({ type: "blob" });
   const url = URL.createObjectURL(blob);
 
   const a = document.createElement("a");
-  a.href = url; a.download = "qtpy_synth_wavetables.zip"; a.click();
+  a.href = url;
+  a.download = "qtpy_synth_wavetables.zip";
+  a.click();
+
   setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
 
@@ -278,11 +370,18 @@ async function onConvert() {
   const doFadeOut = UI.fadeOut.checked;
   const fadeLen = getFadeLen();
 
+  if (!selectedFiles.length) {
+    log("No files.");
+    UI.convertBtn.disabled = false;
+    return;
+  }
+
   log(`Target: ${targetWaves} waves × 256 = ${targetWaves * 256} samples`);
   log(`Fade-in: ${doFadeIn ? "ON" : "OFF"}, Fade-out: ${doFadeOut ? "ON" : "OFF"}, FadeLen: ${fadeLen}`);
 
   try {
     await ensureFFmpeg();
+
     for (let i = 0; i < selectedFiles.length; i++) {
       const f = selectedFiles[i];
       log(`\n[${i + 1}/${selectedFiles.length}] Converting: ${f.name}`);
@@ -290,6 +389,7 @@ async function onConvert() {
       addResult(res.outName, res.blob, res.info);
       log(`OK: ${res.outName}`);
     }
+
     UI.zipBtn.disabled = converted.length <= 1;
     log(`\nDone. Converted: ${converted.length}`);
   } catch (e) {
@@ -299,13 +399,31 @@ async function onConvert() {
   }
 }
 
+async function onLoadOnly() {
+  clearLog();
+  log(`Load ffmpeg only... (${BUILD})`);
+  try {
+    await ensureFFmpeg({ forceReload: false });
+    log("OK: ffmpeg is ready.");
+  } catch (e) {
+    log(`ERROR: ${e?.message || String(e)}`);
+  }
+}
+
 // Bind UI
-UI.drop.addEventListener("dragover", (e) => { e.preventDefault(); UI.drop.classList.add("dragover"); });
-UI.drop.addEventListener("dragleave", () => UI.drop.classList.remove("dragover"));
-UI.drop.addEventListener("drop", (e) => { e.preventDefault(); UI.drop.classList.remove("dragover"); setFiles(e.dataTransfer.files); UI.fileInput.value = ""; });
-UI.fileInput.addEventListener("change", (e) => setFiles(e.target.files));
-UI.convertBtn.addEventListener("click", onConvert);
-UI.zipBtn.addEventListener("click", () => downloadZip().catch((e) => log(`ZIP ERROR: ${e?.message || e}`)));
-UI.selfCheckBtn.addEventListener("click", () => selfCheckDeps().catch((e) => log(`CHECK ERROR: ${e?.message || e}`)));
+UI.drop?.addEventListener("dragover", (e) => { e.preventDefault(); UI.drop.classList.add("dragover"); });
+UI.drop?.addEventListener("dragleave", () => UI.drop.classList.remove("dragover"));
+UI.drop?.addEventListener("drop", (e) => {
+  e.preventDefault();
+  UI.drop.classList.remove("dragover");
+  setFiles(e.dataTransfer.files);
+  UI.fileInput.value = "";
+});
+
+UI.fileInput?.addEventListener("change", (e) => setFiles(e.target.files));
+UI.convertBtn?.addEventListener("click", onConvert);
+UI.zipBtn?.addEventListener("click", () => downloadZip().catch((e) => log(`ZIP ERROR: ${e?.message || e}`)));
+UI.selfCheckBtn?.addEventListener("click", () => selfCheckDeps().catch((e) => log(`CHECK ERROR: ${e?.message || e}`)));
+UI.loadBtn?.addEventListener("click", onLoadOnly);
 
 setFiles([]);
