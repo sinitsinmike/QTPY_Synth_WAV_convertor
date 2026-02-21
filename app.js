@@ -1,10 +1,13 @@
 /**
  * QT Py Synth WAV Converter
+ * build: v4
  *
- * Goals:
- * - Self-check must work even if deps imports fail.
- * - Convert loads deps lazily via dynamic import.
+ * Key idea:
+ * - No top-level imports (so Self-check always works)
+ * - Dynamic import deps only when needed
  */
+const BUILD = "v4";
+
 const UI = {
   drop: document.getElementById("drop"),
   fileInput: document.getElementById("fileInput"),
@@ -19,21 +22,19 @@ const UI = {
   results: document.getElementById("results"),
 };
 
-/** @type {File[]} */
 let selectedFiles = [];
-/** @type {{name:string, blob:Blob}[]} */
 let converted = [];
 
-/** @type {{FFmpeg:any, fetchFile:any, toBlobURL:any, JSZip:any}|null} */
-let deps = null;
-/** @type {any|null} */
+let deps = null; // { FFmpeg, fetchFile, toBlobURL, JSZip }
 let ffmpeg = null;
 let ffmpegLoaded = false;
 
 function log(line) {
-  if (!UI.log) return;
   UI.log.textContent += `${line}\n`;
   UI.log.scrollTop = UI.log.scrollHeight;
+}
+function clearLog() {
+  UI.log.textContent = "";
 }
 
 window.addEventListener("error", (e) => log(`JS ERROR: ${e.message}`));
@@ -41,13 +42,19 @@ window.addEventListener("unhandledrejection", (e) =>
   log(`PROMISE ERROR: ${e.reason?.message || String(e.reason)}`)
 );
 
+log(`app.js loaded (${BUILD})`);
+
 function setFiles(files) {
+  // IMPORTANT: don't filter by File.type (sometimes empty on Safari/others)
   selectedFiles = Array.from(files || []).filter((f) => f && f.name);
+
   UI.convertBtn.disabled = selectedFiles.length === 0;
   UI.zipBtn.disabled = true;
+
   converted = [];
   UI.results.innerHTML = "";
-  UI.log.textContent = "";
+  clearLog();
+  log(`app.js loaded (${BUILD})`);
   if (selectedFiles.length) log(`Selected ${selectedFiles.length} file(s).`);
   else log("No files selected.");
 }
@@ -66,6 +73,9 @@ function getFadeLen() {
 }
 
 async function selfCheckDeps() {
+  clearLog();
+  log(`Self-check started... (${BUILD})`);
+
   const urls = [
     "./app.js",
     "./deps/ffmpeg-core.js",
@@ -76,7 +86,6 @@ async function selfCheckDeps() {
     "./deps/jszip.esm.js",
   ];
 
-  log("Self-check started...");
   for (const url of urls) {
     try {
       const r = await fetch(url, { cache: "no-store" });
@@ -232,14 +241,10 @@ function applyFade(samples, fadeIn, fadeOut, fadeLen) {
   if (n > maxFade) n = maxFade;
   if (n <= 0) return out;
 
-  if (fadeIn) {
-    for (let i = 0; i < n; i++) out[i] = (out[i] * (i / n)) | 0;
-  }
-  if (fadeOut) {
-    for (let i = 0; i < n; i++) {
-      const idx = out.length - n + i;
-      out[idx] = (out[idx] * (1 - i / n)) | 0;
-    }
+  if (fadeIn) for (let i = 0; i < n; i++) out[i] = (out[i] * (i / n)) | 0;
+  if (fadeOut) for (let i = 0; i < n; i++) {
+    const idx = out.length - n + i;
+    out[idx] = (out[idx] * (1 - i / n)) | 0;
   }
   return out;
 }
@@ -247,6 +252,7 @@ function applyFade(samples, fadeIn, fadeOut, fadeLen) {
 async function convertOne(file, targetWaves, doFadeIn, doFadeOut, fadeLen) {
   const { fetchFile } = await loadDeps();
   const base = sanitizeBaseName(file.name);
+
   const inName = `${base}_in.wav`;
   const midName = `${base}_mid.wav`;
   const outName = `${base}_qtpy_${targetWaves}x256.wav`;
@@ -264,6 +270,7 @@ async function convertOne(file, targetWaves, doFadeIn, doFadeOut, fadeLen) {
 
   const mid = await ffmpeg.readFile(midName);
   const midBuf = mid.buffer.slice(mid.byteOffset, mid.byteOffset + mid.byteLength);
+
   const { sampleRate, samples } = parseWavPcm16Mono(midBuf);
   if (sampleRate !== 44100) throw new Error(`Unexpected sample rate after ffmpeg: ${sampleRate}`);
 
@@ -303,6 +310,7 @@ async function downloadZip() {
   const { JSZip } = await loadDeps();
   const zip = new JSZip();
   for (const item of converted) zip.file(item.name, item.blob);
+
   const blob = await zip.generateAsync({ type: "blob" });
   const url = URL.createObjectURL(blob);
 
@@ -317,8 +325,10 @@ async function downloadZip() {
 async function onConvert() {
   UI.convertBtn.disabled = true;
   UI.zipBtn.disabled = true;
+
   UI.results.innerHTML = "";
-  UI.log.textContent = "";
+  clearLog();
+  log(`app.js loaded (${BUILD})`);
   converted = [];
 
   const targetWaves = getTargetWaves();
@@ -355,7 +365,7 @@ async function onConvert() {
   }
 }
 
-// Bind UI (safe even if deps are missing)
+// Bind UI
 UI.drop.addEventListener("dragover", (e) => { e.preventDefault(); UI.drop.classList.add("dragover"); });
 UI.drop.addEventListener("dragleave", () => UI.drop.classList.remove("dragover"));
 UI.drop.addEventListener("drop", (e) => {
@@ -366,6 +376,7 @@ UI.drop.addEventListener("drop", (e) => {
 });
 
 UI.fileInput.addEventListener("change", (e) => setFiles(e.target.files));
+
 UI.convertBtn.addEventListener("click", onConvert);
 UI.zipBtn.addEventListener("click", () => downloadZip().catch((e) => log(`ZIP ERROR: ${e?.message || e}`)));
 UI.selfCheckBtn.addEventListener("click", () => selfCheckDeps().catch((e) => log(`CHECK ERROR: ${e?.message || e}`)));
