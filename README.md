@@ -99,6 +99,8 @@
 
 ## WAV Converter (Web)
 
+https://sinitsinmike.github.io/QTPY_Synth_WAV_convertor/index.html
+
 В репозитории есть веб-страница, которая делает “правильный” WAV для wavetable:
 - Drag & drop одного или нескольких файлов
 - Приведение к:
